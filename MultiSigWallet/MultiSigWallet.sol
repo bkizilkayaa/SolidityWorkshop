@@ -3,14 +3,18 @@ pragma solidity ^0.8.13;
 import "./Pausable.sol";
 
 contract MultiSigWallet is Pausable {
-    address[] public signers; //sahipleri tutan array.
-    uint256 public requiredConfirmations; //önerinin onaylanması için gerekli onay sayısını yapıcıda belirledim.
-    uint256 public nonce; //nonce değeri.
-    mapping(uint256 => Tx) public queueTxs; //Transactionın kuyruktaki yeri
-    mapping(uint256 => mapping(address => bool)) public txConfirmers; //transactionı onaylayanların listesi
+    address[] private signers; //sahipleri tutan array.
+    uint256 private requiredConfirmations; //önerinin onaylanması için gerekli onay sayısını yapıcıda belirledim.
+    uint256 private nonce; //nonce değeri.
+    mapping(uint256 => Tx) private queueTxs; //Transactionın kuyruktaki yeri
+    mapping(uint256 => mapping(address => bool)) private txConfirmers; //transactionı onaylayanların listesi
 
-    event NewProposal(address proposer, uint256 id); //yeni öneri sunulması
-    event Executed(address executor, uint256 id, bool success); //önerinin kabulu ardından çalıştırılması
+    event NewProposal(address proposer, uint256 transactionId); //yeni öneri sunulması
+    event Executed(address executor, uint256 transactionId, bool success); //önerinin kabulu ardından çalıştırılması
+    event ExecutionFailure(uint256 indexed transactionId, bool success); //transaction fail olursa
+    event Revocation(address indexed sender, uint256 indexed transactionId); // Tx revokelaninca.
+    event Confirmation(address indexed sender, uint256 indexed transactionId); //Tx confirmleyince calisiyor.
+    event Deposit(address indexed sender, uint256 value); //contrata ether gönderimi oldugunda.
 
     struct Tx {
         //transaction structı bu sekilde kurgulandı
@@ -30,19 +34,45 @@ contract MultiSigWallet is Pausable {
             _requiredConfirmations <= _signers.length, //verilen parametrelerin mantıklı olup olmadığını kontrol ediyorum
             "Not enough signer."
         );
-        super;
         signers = _signers;
         requiredConfirmations = _requiredConfirmations;
     }
 
-    receive() external payable {} //boş calldata geldiğinde çalışan, ödeme alan receive fonksiyonu
+    //getter'lar.
+    function getSigners() public view virtual returns (address[] memory) {
+        return signers;
+    }
 
-    fallback() external payable {} //payable fallback function
+    function getRequiredConfirmations() public view virtual returns (uint256) {
+        return requiredConfirmations;
+    }
+
+    function getNonce() public view virtual returns (uint256) {
+        return nonce;
+    }
+
+    function getQueueTxs(uint256 _number)
+        public
+        view
+        virtual
+        returns (Tx memory)
+    {
+        return queueTxs[_number];
+    }
+
+    function getTxConfirmers(uint256 _number, address _caller)
+        public
+        view
+        virtual
+        returns (bool)
+    {
+        return txConfirmers[_number][_caller];
+    }
 
     //herhangi bir signer'ın yeni bir öneri yapması.
     function proposeTransaction(
         uint256 _deadline, //ileriye yönelik bi tarih.
-        address _txAddress, //transaction addressi
+        address _txAddress, //hedef adres
         uint256 _value, // ether değeri
         bytes calldata _txData //gönderilecek olan data
     ) external onlySigners checkTimestamp(_deadline) whenNotPaused {
@@ -73,9 +103,9 @@ contract MultiSigWallet is Pausable {
         //zaten onay sayısını toplayarak işleme koyulan bir öneriyi approvelatmıyorum
         require(queueTxs[_nonce].deadline > block.timestamp, "Out of time");
         //onaylanacak olan tx'ın deadlineı devam etmeli.
-
         queueTxs[_nonce].confirmations++; //confirm+1
         txConfirmers[_nonce][msg.sender] = true; //o öneriyi msg.sender onaylamış oldu
+        emit Confirmation(msg.sender, _nonce);
     }
 
     //signerlarin önceden onay verdiği tx'ları revokelamalarini saglar.
@@ -97,6 +127,7 @@ contract MultiSigWallet is Pausable {
         //bir transactionı bir signer revoke edilebilmesi için önceden o tx i approvelamalı.
         queueTxs[_nonce].confirmations--; //confirm - 1
         txConfirmers[_nonce][msg.sender] = false; //o öneriyi msg.sender artık revokelamış oldu
+        emit Revocation(msg.sender, _nonce);
     }
 
     function executeTx(uint256 _nonce)
@@ -128,9 +159,10 @@ contract MultiSigWallet is Pausable {
             value: queueTxs[_nonce].value
         }(queueTxs[_nonce].txData);
 
-        if (!txSuccess)
-            //transaction başarısız olursa false ataması yapılır
-            queueTxs[_nonce].executed = false; //burada hata/log fırlatmalıyım aslında.
+        if (!txSuccess) {
+            queueTxs[_nonce].executed = false;
+            emit ExecutionFailure(_nonce, false);
+        } //transaction başarısız olursa false ataması yapılır
 
         emit Executed(msg.sender, _nonce, txSuccess);
         return txSuccess;
@@ -181,13 +213,11 @@ contract MultiSigWallet is Pausable {
     }
 
     function pause() external onlySigners whenNotPaused {
-        //solidity tarafından kullanımı publicten internal'e değiştirildi.
-        //bu sebeple -artık- super keywordü ile kullanıp kontratı kontrol edebiliyoruz.
-        super._pause();
+        _pause(); //Pausable.sol method.
     }
 
     function unpause() external onlySigners whenPaused {
-        super._unpause();
+        _unpause(); //Pausable.sol method.
     }
 
     //signers array kontrolü
@@ -208,18 +238,18 @@ contract MultiSigWallet is Pausable {
         require(_deadLine > block.timestamp, "Out of time");
         _;
     }
-}
 
-contract A {
-    uint256 public x;
+    receive() external payable {
+        if (msg.value > 0) {
+            emit Deposit(msg.sender, msg.value);
+        }
+    } //boş calldata geldiğinde çalışan, ödeme alan receive fonksiyonu
 
-    function increment() external {
-        x++;
-    }
-
-    function getFnData() public pure returns (bytes memory) {
-        return abi.encodeWithSignature("increment()");
-    }
+    fallback() external payable {
+        if (msg.value > 0) {
+            emit Deposit(msg.sender, msg.value);
+        }
+    } //payable fallback function
 }
 
 //["0x5B38Da6a701c568545dCfcB03FcB875f56beddC4","0xAb8483F64d9C6d1EcF9b849Ae677dD3315835cb2","0x4B20993Bc481177ec7E8f571ceCaE8A9e22C02db"]
