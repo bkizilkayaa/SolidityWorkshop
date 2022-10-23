@@ -6,8 +6,9 @@ contract MultiSigWallet is Pausable {
     address[] private signers; //sahipleri tutan array.
     uint256 private requiredConfirmations; //önerinin onaylanması için gerekli onay sayısını yapıcıda belirledim.
     uint256 private nonce; //nonce değeri.
-    mapping(uint256 => Tx) private queueTxs; //Transactionın kuyruktaki yeri
+    mapping(uint256 => Tx) public queueTxs; //Transactionın kuyruktaki yeri
     mapping(uint256 => mapping(address => bool)) private txConfirmers; //transactionı onaylayanların listesi
+    uint256[] private consensusArray; //uzlaşma değerlerini tuttuğum array.
 
     event NewProposal(address proposer, uint256 transactionId); //yeni öneri sunulması
     event Executed(address executor, uint256 transactionId, bool success); //önerinin kabulu ardından çalıştırılması
@@ -25,6 +26,7 @@ contract MultiSigWallet is Pausable {
         address txAddress; //hedef adres
         uint256 value; //gönderilecek deger
         bytes txData; //gönderilecek data.
+        uint256 consensus; //uzlaşma sağlanacak olan değer
     }
 
     constructor(address[] memory _signers, uint256 _requiredConfirmations) {
@@ -39,25 +41,64 @@ contract MultiSigWallet is Pausable {
     }
 
     //getter'lar.
-    function getSigners() public view virtual returns (address[] memory) {
+    function getSigners() public view returns (address[] memory) {
         return signers;
     }
 
-    function getRequiredConfirmations() public view virtual returns (uint256) {
+    function getRequiredConfirmations() public view returns (uint256) {
         return requiredConfirmations;
+    }
+
+    function getConsensus(uint256 _nonce)
+        public
+        view
+        onlySigners
+        returns (uint256)
+    {
+        return queueTxs[_nonce].consensus;
+    }
+
+    //setting consensus variable
+    function setConsensus(uint256 _nonce, uint256 _consensus)
+        external
+        onlySigners
+    {
+        require(_nonce < nonce, "Not an existing transaction");
+        //geçerli bir nonce değeri lazım
+        require(queueTxs[_nonce].deadline > block.timestamp, "Out of time");
+        //uzlaşılacak olan tx'ın deadlineı devam etmeli.
+        consensusArray.push(_consensus); //önce sayıyı diziye pushladım
+        queueTxs[_nonce].consensus = _consensus; //ardından tx içerisindeki sayıyı güncelledim
+        uint256 calculatedWalletNum = (signers.length / 2) + 1; //yarısı +1 kadar giriş ve consensus sağlanmalı
+        if (consensusArray.length >= calculatedWalletNum) {
+            uint256 maxElement = getMostRepeatingElement(); //konsensus sağlanan sayı
+            uint256 counter = getMostRepeatingCount(maxElement); //ve kaç uzlaşma sağlandı bilgisi.
+            if (counter >= calculatedWalletNum) {
+                //konsensus sağlanan değer, signerların yarısından fazla olmalı.
+                queueTxs[_nonce].consensus = maxElement;
+                queueTxs[_nonce].confirmations = requiredConfirmations; //gerekli onaylar toplandı.
+                bool success = executeTx(_nonce); //Tx çalıştırılır
+                if (success) emit Executed(msg.sender, _nonce, success);
+                else emit ExecutionFailure(_nonce, success);
+            }
+        }
     }
 
     function getNonce() public view virtual returns (uint256) {
         return nonce;
     }
 
-    function getQueueTxs(uint256 _number)
+    /*function getQueueTxs(uint256 _number)
         public
         view
         virtual
         returns (Tx memory)
     {
         return queueTxs[_number];
+    }*/
+
+    function getBalance() public view onlySigners returns (uint256 _balance) {
+        _balance = address(this).balance; //kontratın içerisindeki ether value return ediliyor..
     }
 
     function getTxConfirmers(uint256 _number, address _caller)
@@ -83,7 +124,8 @@ contract MultiSigWallet is Pausable {
             deadline: _deadline, //önerinin geçerli olacağı timestamp
             txAddress: _txAddress,
             value: _value, //ether değerleri vs burada tutuluyor
-            txData: _txData //data gönderimi varsa
+            txData: _txData, //data gönderimi varsa
+            consensus: 0
         });
 
         queueTxs[nonce] = _tx; //transaction kuyruğunun 0.nonce'una default bir Transaction ataması yapar.
@@ -131,7 +173,7 @@ contract MultiSigWallet is Pausable {
     }
 
     function executeTx(uint256 _nonce)
-        external
+        public
         onlySigners
         whenNotPaused
         returns (bool)
@@ -165,27 +207,9 @@ contract MultiSigWallet is Pausable {
         } //transaction başarısız olursa false ataması yapılır
 
         emit Executed(msg.sender, _nonce, txSuccess);
+        //"Use delete on arrays to delete all its elements." [solidity docs] but version 17 :'(
+        delete consensusArray; // bu şöyle bir şey => consensusArray.length=0;
         return txSuccess;
-    }
-
-    //verilen arrayi kontrol edip bool döner.
-    function isValid(address[] memory _signerArray)
-        private
-        pure
-        returns (bool)
-    {
-        for (uint256 i = 0; i < _signerArray.length - 1; i++) {
-            for (uint256 j = i + 1; j < _signerArray.length; j++) {
-                require(_signerArray[i] != address(0), "Invalid address"); //adresler boş olmamalı
-                require(_signerArray[j] != address(0), "Invalid address");
-                //ve adresler birbiriyle aynı olmamalı.
-                require(
-                    _signerArray[i] != _signerArray[j],
-                    "Duplicate address."
-                );
-            }
-        }
-        return true;
     }
 
     function deleteTx(uint256 _nonce) external onlySigners whenNotPaused {
@@ -208,16 +232,72 @@ contract MultiSigWallet is Pausable {
         //executed false
     }
 
-    function getBalance() public view onlySigners returns (uint256 _balance) {
-        _balance = address(this).balance; //kontratın içerisindeki ether value return ediliyor..
-    }
-
     function pause() external onlySigners whenNotPaused {
         _pause(); //Pausable.sol method.
     }
 
     function unpause() external onlySigners whenPaused {
         _unpause(); //Pausable.sol method.
+    }
+
+    //verilen arrayi kontrol edip bool döner.
+    function isValid(address[] memory _signerArray)
+        private
+        pure
+        returns (bool)
+    {
+        for (uint256 i = 0; i < _signerArray.length - 1; i++) {
+            for (uint256 j = i + 1; j < _signerArray.length; j++) {
+                require(_signerArray[i] != address(0), "Invalid address"); //adresler boş olmamalı
+                require(_signerArray[j] != address(0), "Invalid address");
+                //ve adresler birbiriyle aynı olmamalı.
+                require(
+                    _signerArray[i] != _signerArray[j],
+                    "Duplicate address."
+                );
+            }
+        }
+        return true;
+    }
+
+    function getMostRepeatingElement()
+        internal
+        view
+        onlySigners
+        whenNotPaused
+        returns (uint256)
+    {
+        uint256 maxElement;
+        uint256 count;
+        uint256 maxCount = 0;
+        for (uint256 i = 0; i < consensusArray.length - 1; i++) {
+            count = 1;
+            for (uint256 j = 0; j < consensusArray.length - 1; j++) {
+                if (consensusArray[j] == consensusArray[i]) {
+                    count++;
+                    if (count > maxCount) {
+                        maxElement = consensusArray[j];
+                    }
+                }
+            }
+        }
+        return maxElement;
+    }
+
+    function getMostRepeatingCount(uint256 _myNum)
+        internal
+        view
+        onlySigners
+        whenNotPaused
+        returns (uint256)
+    {
+        uint256 count = 1;
+        for (uint256 i = 0; i < consensusArray.length - 1; i++) {
+            if (consensusArray[i] == _myNum) {
+                count++;
+            }
+        }
+        return count;
     }
 
     //signers array kontrolü
@@ -252,4 +332,4 @@ contract MultiSigWallet is Pausable {
     } //payable fallback function
 }
 
-//["0x5B38Da6a701c568545dCfcB03FcB875f56beddC4","0xAb8483F64d9C6d1EcF9b849Ae677dD3315835cb2","0x4B20993Bc481177ec7E8f571ceCaE8A9e22C02db"]
+//["0x5B38Da6a701c568545dCfcB03FcB875f56beddC4","0xAb8483F64d9C6d1EcF9b849Ae677dD3315835cb2","0x4B20993Bc481177ec7E8f571ceCaE8A9e22C02db","0x78731D3Ca6b7E34aC0F824c42a7cC18A495cabaB"]
